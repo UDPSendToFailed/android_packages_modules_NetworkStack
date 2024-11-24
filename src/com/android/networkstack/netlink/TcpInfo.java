@@ -138,9 +138,6 @@ public class TcpInfo {
     private TcpInfo(@NonNull ByteBuffer bytes, int infolen) {
         // SEGS_IN is the last required field in the buffer, so if the buffer is long enough for
         // SEGS_IN it's long enough for everything
-        if (SEGS_IN_OFFSET + Field.SEGS_IN.size > infolen) {
-            throw new IllegalArgumentException("Length " + infolen + " is less than required.");
-        }
         final int start = bytes.position();
         mSegsIn = bytes.getInt(start + SEGS_IN_OFFSET);
         mSegsOut = bytes.getInt(start + SEGS_OUT_OFFSET);

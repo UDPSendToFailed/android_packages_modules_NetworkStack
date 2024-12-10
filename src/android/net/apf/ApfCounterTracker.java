@@ -50,6 +50,7 @@ public class ApfCounterTracker {
         APF_VERSION,
         APF_PROGRAM_ID,
         // TODO: removing PASSED_ARP after remove LegacyApfFilter.java
+        // The counter sequence should keep the same as ApfSessionInfoMetrics.java
         PASSED_ARP,  // see also MIN_PASS_COUNTER below.
         PASSED_ARP_BROADCAST_REPLY,
         // TODO: removing PASSED_ARP_NON_IPV4 after remove LegacyApfFilter.java
@@ -58,13 +59,16 @@ public class ApfCounterTracker {
         PASSED_ARP_UNICAST_REPLY,
         PASSED_ARP_UNKNOWN,
         PASSED_DHCP,
+        PASSED_ETHER_OUR_SRC_MAC,
         PASSED_IPV4,
         PASSED_IPV4_FROM_DHCPV4_SERVER,
         PASSED_IPV4_UNICAST,
         PASSED_IPV6_ICMP,
         PASSED_IPV6_NON_ICMP,
-        PASSED_IPV6_NS_MULTIPLE_OPTIONS,
+        PASSED_IPV6_NS_DAD,
         PASSED_IPV6_NS_NO_ADDRESS,
+        PASSED_IPV6_NS_NO_SLLA_OPTION,
+        PASSED_IPV6_NS_TENTATIVE,
         PASSED_IPV6_UNICAST_NON_ICMP,
         PASSED_NON_IP_UNICAST,
         PASSED_MDNS,
@@ -83,6 +87,7 @@ public class ApfCounterTracker {
         DROPPED_IPV6_NON_ICMP_MULTICAST,
         DROPPED_IPV6_NS_INVALID,
         DROPPED_IPV6_NS_OTHER_HOST,
+        DROPPED_IPV6_NS_REPLIED_NON_DAD,
         DROPPED_802_3_FRAME,
         DROPPED_ETHERTYPE_NOT_ALLOWED,
         DROPPED_IPV4_KEEPALIVE_ACK,
@@ -199,7 +204,7 @@ public class ApfCounterTracker {
                 value = 0;
             }
             long oldValue = mCounters.getOrDefault(counter, 0L);
-            // All counters are increamental
+            // All counters are incremental
             if (value > oldValue) {
                 mCounters.put(counter, value);
             }
@@ -211,5 +216,12 @@ public class ApfCounterTracker {
      */
     public Map<Counter, Long> getCounters() {
         return mCounters;
+    }
+
+    /**
+     * Clear all counters.
+     */
+    public void clearCounters() {
+        mCounters.clear();
     }
 }

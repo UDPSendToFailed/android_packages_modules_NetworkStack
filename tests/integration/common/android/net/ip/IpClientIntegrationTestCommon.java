@@ -41,8 +41,15 @@ import static android.net.ip.IIpClientCallbacks.DTIM_MULTIPLIER_RESET;
 import static android.net.ip.IpClient.CONFIG_IPV6_AUTOCONF_TIMEOUT;
 import static android.net.ip.IpClient.CONFIG_ACCEPT_RA_MIN_LFT;
 import static android.net.ip.IpClient.CONFIG_APF_COUNTER_POLLING_INTERVAL_SECS;
+import static android.net.ip.IpClient.CONFIG_NUD_FAILURE_COUNT_DAILY_THRESHOLD;
+import static android.net.ip.IpClient.CONFIG_NUD_FAILURE_COUNT_WEEKLY_THRESHOLD;
 import static android.net.ip.IpClient.DEFAULT_ACCEPT_RA_MIN_LFT;
 import static android.net.ip.IpClient.DEFAULT_APF_COUNTER_POLLING_INTERVAL_SECS;
+import static android.net.ip.IpClient.DEFAULT_NUD_FAILURE_COUNT_DAILY_THRESHOLD;
+import static android.net.ip.IpClient.DEFAULT_NUD_FAILURE_COUNT_WEEKLY_THRESHOLD;
+import static android.net.ip.IpClient.ONE_DAY_IN_MS;
+import static android.net.ip.IpClient.ONE_WEEK_IN_MS;
+import static android.net.ip.IpClient.SIX_HOURS_IN_MS;
 import static android.net.ip.IpClientLinkObserver.CLAT_PREFIX;
 import static android.net.ip.IpClientLinkObserver.CONFIG_SOCKET_RECV_BUFSIZE;
 import static android.net.ip.IpReachabilityMonitor.NUD_MCAST_RESOLICIT_NUM;
@@ -83,6 +90,7 @@ import static com.android.networkstack.util.NetworkStackUtils.IPCLIENT_POPULATE_
 import static com.android.networkstack.util.NetworkStackUtils.IP_REACHABILITY_IGNORE_INCOMPLETE_IPV6_DEFAULT_ROUTER_VERSION;
 import static com.android.networkstack.util.NetworkStackUtils.IP_REACHABILITY_IGNORE_INCOMPLETE_IPV6_DNS_SERVER_VERSION;
 import static com.android.networkstack.util.NetworkStackUtils.IP_REACHABILITY_IGNORE_NEVER_REACHABLE_NEIGHBOR_VERSION;
+import static com.android.networkstack.util.NetworkStackUtils.IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION;
 import static com.android.networkstack.util.NetworkStackUtils.IP_REACHABILITY_IGNORE_ORGANIC_NUD_FAILURE_VERSION;
 import static com.android.networkstack.util.NetworkStackUtils.IP_REACHABILITY_ROUTER_MAC_CHANGE_FAILURE_ONLY_AFTER_ROAM_VERSION;
 import static com.android.testutils.MiscAsserts.assertThrows;
@@ -133,6 +141,7 @@ import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.net.ConnectivityManager;
 import android.net.DhcpResultsParcelable;
+import android.net.IIpMemoryStore;
 import android.net.INetd;
 import android.net.InetAddresses;
 import android.net.InterfaceConfigurationParcel;
@@ -167,6 +176,7 @@ import android.net.dhcp6.Dhcp6RequestPacket;
 import android.net.dhcp6.Dhcp6SolicitPacket;
 import android.net.ipmemorystore.NetworkAttributes;
 import android.net.ipmemorystore.OnNetworkAttributesRetrievedListener;
+import android.net.ipmemorystore.OnNetworkEventCountRetrievedListener;
 import android.net.ipmemorystore.Status;
 import android.net.networkstack.TestNetworkStackServiceClient;
 import android.net.networkstack.aidl.dhcp.DhcpOption;
@@ -190,6 +200,7 @@ import android.stats.connectivity.NudEventType;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.util.Log;
+import android.util.Pair;
 
 import androidx.annotation.NonNull;
 import androidx.test.InstrumentationRegistry;
@@ -372,6 +383,7 @@ public abstract class IpClientIntegrationTestCommon {
 
     protected IpClient mIpc;
     protected Dependencies mDependencies;
+    protected List<Pair<String, Pair<Long, Integer>>> mNetworkEvents = new ArrayList<>();
 
     /***** END signature required test members *****/
 
@@ -691,6 +703,11 @@ public abstract class IpClientIntegrationTestCommon {
 
     protected abstract int readNudSolicitNumPostRoamingFromResource();
 
+    protected abstract void storeNetworkEvent(String cluster, long now, long expiry, int eventType);
+
+    protected abstract int[] getStoredNetworkEventCount(String cluster, long[] sinceTimes,
+            int[] eventType, long timeout);
+
     protected final boolean testSkipped() {
         if (!useNetworkStackSignature() && !TestNetworkStackServiceClient.isSupported()) {
             fail("Device running root tests doesn't support TestNetworkStackServiceClient.");
@@ -821,6 +838,19 @@ public abstract class IpClientIntegrationTestCommon {
         when(mPackageManager.getPackagesForUid(TEST_DEVICE_OWNER_APP_UID)).thenReturn(
                 new String[] { TEST_DEVICE_OWNER_APP_PACKAGE });
 
+        // Retrieve the network event count.
+        doAnswer(invocation -> {
+            final String cluster = invocation.getArgument(0);
+            final long[] sinceTimes = invocation.getArgument(1);
+            final int[] eventType = invocation.getArgument(2);
+            ((OnNetworkEventCountRetrievedListener) invocation.getArgument(3))
+                    .onNetworkEventCountRetrieved(
+                            new Status(SUCCESS),
+                            getStoredNetworkEventCount(cluster, sinceTimes, eventType,
+                                    0 /* timeout not used */));
+            return null;
+        }).when(mIpMemoryStore).retrieveNetworkEventCount(eq(TEST_CLUSTER), any(), any(), any());
+
         setDeviceConfigProperty(IpClient.CONFIG_MIN_RDNSS_LIFETIME, 67);
         setDeviceConfigProperty(DhcpClient.DHCP_RESTART_CONFIG_DELAY, 10);
         setDeviceConfigProperty(DhcpClient.ARP_FIRST_PROBE_DELAY_MS, 10);
@@ -844,6 +874,12 @@ public abstract class IpClientIntegrationTestCommon {
         // Set the polling interval to update APF data snapshot.
         setDeviceConfigProperty(CONFIG_APF_COUNTER_POLLING_INTERVAL_SECS,
                 DEFAULT_APF_COUNTER_POLLING_INTERVAL_SECS);
+
+        // Set the NUD failure event count daily and weekly thresholds.
+        setDeviceConfigProperty(CONFIG_NUD_FAILURE_COUNT_DAILY_THRESHOLD,
+                DEFAULT_NUD_FAILURE_COUNT_DAILY_THRESHOLD);
+        setDeviceConfigProperty(CONFIG_NUD_FAILURE_COUNT_WEEKLY_THRESHOLD,
+                DEFAULT_NUD_FAILURE_COUNT_WEEKLY_THRESHOLD);
     }
 
     private void awaitIpClientShutdown() throws Exception {
@@ -2855,17 +2891,6 @@ public abstract class IpClientIntegrationTestCommon {
                 (byte) 0x06, data);
     }
 
-    private void assertDhcpResultsParcelable(final DhcpResultsParcelable lease) {
-        assertNotNull(lease);
-        assertEquals(CLIENT_ADDR, lease.baseConfiguration.getIpAddress().getAddress());
-        assertEquals(SERVER_ADDR, lease.baseConfiguration.getGateway());
-        assertEquals(1, lease.baseConfiguration.getDnsServers().size());
-        assertTrue(lease.baseConfiguration.getDnsServers().contains(SERVER_ADDR));
-        assertEquals(SERVER_ADDR, InetAddresses.parseNumericAddress(lease.serverAddress));
-        assertEquals(TEST_DEFAULT_MTU, lease.mtu);
-        assertEquals(TEST_LEASE_DURATION_S, lease.leaseDuration);
-    }
-
     private void doUpstreamHotspotDetectionTest(final int id, final String displayName,
             final String ssid, final byte[] oui, final byte type, final byte[] data,
             final boolean expectMetered) throws Exception {
@@ -2884,7 +2909,13 @@ public abstract class IpClientIntegrationTestCommon {
                 ArgumentCaptor.forClass(DhcpResultsParcelable.class);
         verify(mCb, timeout(TEST_TIMEOUT_MS)).onNewDhcpResults(captor.capture());
         final DhcpResultsParcelable lease = captor.getValue();
-        assertDhcpResultsParcelable(lease);
+        assertNotNull(lease);
+        assertEquals(CLIENT_ADDR, lease.baseConfiguration.getIpAddress().getAddress());
+        assertEquals(SERVER_ADDR, lease.baseConfiguration.getGateway());
+        assertEquals(1, lease.baseConfiguration.getDnsServers().size());
+        assertTrue(lease.baseConfiguration.getDnsServers().contains(SERVER_ADDR));
+        assertEquals(SERVER_ADDR, InetAddresses.parseNumericAddress(lease.serverAddress));
+        assertEquals(TEST_DEFAULT_MTU, lease.mtu);
 
         if (expectMetered) {
             assertEquals(lease.vendorInfo, DhcpPacket.VENDOR_INFO_ANDROID_METERED);
@@ -4312,6 +4343,9 @@ public abstract class IpClientIntegrationTestCommon {
                 // neighbor reachability checking relevant test cases, that guarantees
                 // avoidingBadLinks() always returns true which is expected.
                 .withoutMultinetworkPolicyTracker()
+                // Make cluster as non-null to test the NUD failure event count query logic.
+                .withLayer2Information(new Layer2Information(TEST_L2KEY, TEST_CLUSTER,
+                       MacAddress.fromString(TEST_DEFAULT_BSSID)))
                 .build();
         startIpClientProvisioning(config);
         verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(true);
@@ -5874,7 +5908,7 @@ public abstract class IpClientIntegrationTestCommon {
         final ProvisioningConfiguration cfg = new ProvisioningConfiguration.Builder()
                 .withoutIPv6()
                 .build();
-        setDeviceConfigProperty(CONFIG_MINIMUM_LEASE,  5 /* default minimum lease */);
+        setDeviceConfigProperty(CONFIG_MINIMUM_LEASE,  5/* default minimum lease */);
         startIpClientProvisioning(cfg);
         handleDhcpPackets(true /* isSuccessLease */, 4 /* lease duration */,
                 false /* shouldReplyRapidCommitAck */, TEST_DEFAULT_MTU,
@@ -5889,8 +5923,6 @@ public abstract class IpClientIntegrationTestCommon {
         sendArpReply(request.senderHwAddress.toByteArray() /* dst */, ROUTER_MAC_BYTES /* srcMac */,
                 request.senderIp /* target IP */, SERVER_ADDR /* sender IP */);
 
-        clearInvocations(mCb);
-
         // Then client sends unicast DHCPREQUEST to extend the IPv4 address lifetime, and we reply
         // with DHCPACK to refresh the DHCP lease.
         final DhcpPacket packet = getNextDhcpPacket();
@@ -5900,32 +5932,12 @@ public abstract class IpClientIntegrationTestCommon {
                 TEST_LEASE_DURATION_S, (short) TEST_DEFAULT_MTU,
                 false /* rapidCommit */, null /* captivePortalApiUrl */));
 
-        // The IPv4 link address lifetime should be also updated after a success DHCP renew, check
-        // that we should never see provisioning failure.
-        verify(mCb, after(100).never()).onProvisioningFailure(any());
-
-        final ArgumentCaptor<DhcpResultsParcelable> dhcpResultsCaptor =
-                ArgumentCaptor.forClass(DhcpResultsParcelable.class);
-        verify(mCb, timeout(TEST_TIMEOUT_MS)).onNewDhcpResults(dhcpResultsCaptor.capture());
-        final DhcpResultsParcelable lease = dhcpResultsCaptor.getValue();
-        assertDhcpResultsParcelable(lease);
-
-        // Check if the IPv4 address lifetime has updated along with a success DHCP renew.
-        verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(argThat(x -> {
-            for (LinkAddress la : x.getLinkAddresses()) {
-                if (la.isIpv4()) {
-                    final long now = SystemClock.elapsedRealtime();
-                    final long when = now + 3600 * 1000;
-                    return (la.getDeprecationTime() != LinkAddress.LIFETIME_UNKNOWN)
-                            && (la.getExpirationTime() != LinkAddress.LIFETIME_UNKNOWN)
-                            && (la.getDeprecationTime() < when + TEST_LIFETIME_TOLERANCE_MS)
-                            && (la.getDeprecationTime() > when - TEST_LIFETIME_TOLERANCE_MS)
-                            && (la.getExpirationTime() < when + TEST_LIFETIME_TOLERANCE_MS)
-                            && (la.getExpirationTime() > when - TEST_LIFETIME_TOLERANCE_MS);
-                }
-            }
-            return false;
-        }));
+        // Once the IPCLIENT_POPULATE_LINK_ADDRESS_LIFETIME_VERSION flag is enabled, the IP
+        // lease will be refreshed as well as the link address lifetime by transiting to
+        // ConfiguringInterfaceState, where IpClient sends a new RTM_NEWADDR message to kernel
+        // to update the IPv4 address, therefore, we should never see provisioning failure any
+        // more.
+        verify(mCb, never()).onProvisioningFailure(any());
     }
 
     private void doDhcpHostnameSettingTest(int hostnameSetting,
@@ -6012,5 +6024,160 @@ public abstract class IpClientIntegrationTestCommon {
         // disabled, we expect that the DHCP packet doesn't take a hostname option.
         doDhcpHostnameSettingTest(IIpClient.HOSTNAME_SETTING_DO_NOT_SEND,
                 false /* isHostnameConfigurationEnabled */, false /* expectSendHostname */);
+    }
+
+    // Store the network event to database multiple times.
+    private void storeNudFailureEvents(long when, long expiry, int times, int eventType) {
+        for (int i = 0; i < times; i++) {
+            storeNetworkEvent(TEST_CLUSTER, when, expiry, eventType);
+            when += 60 * 1000; // event interval is 1min
+            expiry += 60 * 1000; // expiry also delays 1min
+        }
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = true)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastDay() throws Exception {
+        // // NUD failure event count exceeds daily threshold nor weekly.
+        final long when = System.currentTimeMillis() - ONE_DAY_IN_MS / 2; // 12h ago
+        final long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 10, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        runIpReachabilityMonitorProbeFailedTest();
+        assertNeverNotifyNeighborLost();
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = false)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastDay_flagOff() throws Exception {
+        // NUD failure event count exceeds daily threshold nor weekly.
+        final long when = System.currentTimeMillis() - ONE_DAY_IN_MS / 2; // 12h ago
+        final long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 19, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        runIpReachabilityMonitorProbeFailedTest();
+        assertNotifyNeighborLost(ROUTER_LINK_LOCAL /* targetIp */,
+                NudEventType.NUD_POST_ROAMING_FAILED_CRITICAL);
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = true)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastDay_notUpToThreshold()
+            throws Exception {
+        // NUD failure event count doesn't exceed either weekly threshold nor daily.
+        final long when = System.currentTimeMillis() - ONE_DAY_IN_MS / 2; // 12h ago
+        final long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 9, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        runIpReachabilityMonitorProbeFailedTest();
+        assertNotifyNeighborLost(ROUTER_LINK_LOCAL /* targetIp */,
+                NudEventType.NUD_POST_ROAMING_FAILED_CRITICAL);
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = true)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastWeek() throws Exception {
+        // NUD failure event count exceeds the weekly threshold, but not daily threshold in the past
+        // day.
+        long when = System.currentTimeMillis() - ONE_WEEK_IN_MS / 2; // half a week ago
+        long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 11, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        when = System.currentTimeMillis() - ONE_DAY_IN_MS / 2; // 12h ago
+        expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 9, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        runIpReachabilityMonitorProbeFailedTest();
+        assertNeverNotifyNeighborLost();
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = false)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastWeek_flagOff() throws Exception {
+        // NUD failure event count exceeds the weekly threshold, but not daily threshold in the past
+        // day.
+        long when = System.currentTimeMillis() - ONE_WEEK_IN_MS / 2; // half a week ago
+        long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 11, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        when = System.currentTimeMillis() - ONE_DAY_IN_MS / 2; // 12h ago
+        expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 9, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        runIpReachabilityMonitorProbeFailedTest();
+        assertNotifyNeighborLost(ROUTER_LINK_LOCAL /* targetIp */,
+                NudEventType.NUD_POST_ROAMING_FAILED_CRITICAL);
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = true)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastWeek_notUpToThreshold() throws Exception {
+        // NUD failure event count doesn't exceed either weekly threshold nor daily.
+        long when = System.currentTimeMillis() - ONE_WEEK_IN_MS / 2; // half a week ago
+        long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 10, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        when = System.currentTimeMillis() - ONE_DAY_IN_MS / 2; // 12h ago
+        expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 9, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ROAM);
+
+        runIpReachabilityMonitorProbeFailedTest();
+        assertNotifyNeighborLost(ROUTER_LINK_LOCAL /* targetIp */,
+                NudEventType.NUD_POST_ROAMING_FAILED_CRITICAL);
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = true)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastWeek_stopWritingEvent() throws Exception {
+        long when = (long) (System.currentTimeMillis() - SIX_HOURS_IN_MS * 0.9);
+        long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 10, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ORGANIC);
+
+        runIpReachabilityMonitorAddressResolutionTest(IPV6_OFF_LINK_DNS_SERVER,
+                ROUTER_LINK_LOCAL /* targetIp */,
+                false /* expectNeighborLost */);
+        verify(mIpMemoryStore, never()).storeNetworkEvent(any(), anyLong(), anyLong(),
+                eq(IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ORGANIC), any());
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = false)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastWeek_stopWritingEvent_flagOff()
+            throws Exception {
+        long when = (long) (System.currentTimeMillis() - SIX_HOURS_IN_MS * 0.9);
+        long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 10, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ORGANIC);
+
+        runIpReachabilityMonitorAddressResolutionTest(IPV6_OFF_LINK_DNS_SERVER,
+                ROUTER_LINK_LOCAL /* targetIp */,
+                true /* expectNeighborLost */);
+        verify(mIpMemoryStore, never()).storeNetworkEvent(any(), anyLong(), anyLong(),
+                eq(IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ORGANIC), any());
+    }
+
+    @Test
+    @Flag(name = IP_REACHABILITY_IGNORE_NUD_FAILURE_VERSION, enabled = true)
+    @SignatureRequiredTest(reason = "need to delete cluster from real db in tearDown")
+    public void testIgnoreNudFailuresIfTooManyInPastWeek_stopWritingEvent_notUpToThreshold()
+            throws Exception {
+        long when = (long) (System.currentTimeMillis() - SIX_HOURS_IN_MS * 0.9);
+        long expiry = when + ONE_WEEK_IN_MS;
+        storeNudFailureEvents(when, expiry, 9, IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ORGANIC);
+
+        runIpReachabilityMonitorAddressResolutionTest(IPV6_OFF_LINK_DNS_SERVER,
+                ROUTER_LINK_LOCAL /* targetIp */,
+                true /* expectNeighborLost */);
+        assertNotifyNeighborLost(ROUTER_LINK_LOCAL /* targetIp */,
+                NudEventType.NUD_ORGANIC_FAILED_CRITICAL);
+        verify(mIpMemoryStore).storeNetworkEvent(any(), anyLong(), anyLong(),
+                eq(IIpMemoryStore.NETWORK_EVENT_NUD_FAILURE_ORGANIC), any());
     }
 }

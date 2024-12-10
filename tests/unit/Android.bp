@@ -32,13 +32,13 @@ java_defaults {
         "kotlin-reflect",
         "mockito-target-extended-minus-junit4",
         "net-tests-utils",
-        //"net-utils-framework-common",
+        "net-utils-framework-common",
         "testables",
     ],
     libs: [
-        "android.test.runner",
-        "android.test.base",
-        "android.test.mock",
+        "android.test.runner.stubs",
+        "android.test.base.stubs",
+        "android.test.mock.stubs",
     ],
     defaults: [
         "framework-connectivity-test-defaults",
